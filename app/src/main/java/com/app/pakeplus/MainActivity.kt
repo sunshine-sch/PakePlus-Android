@@ -68,6 +68,9 @@ class MainActivity : AppCompatActivity() {
 //    private lateinit var binding: ActivityMainBinding
 
     private lateinit var webView: WebView
+    private var assetsStaticServer: AssetsStaticServer? = null
+    /** 例如 http://127.0.0.1:23456，仅在通过本地静态服务加载 assets 时非空 */
+    private var localAssetsOrigin: String? = null
     private lateinit var gestureDetector: GestureDetectorCompat
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
@@ -322,8 +325,14 @@ class MainActivity : AppCompatActivity() {
             false
         }
 
-        // load webUrl or file:///android_asset/index.html
-        webView.loadUrl(webUrl)
+        val assetRel = androidAssetRelativePath(webUrl)
+        val urlToLoad = if (assetRel != null) {
+            val origin = ensureLocalAssetsServer()
+            if (origin != null) toLocalServerUrl(origin, assetRel) else webUrl
+        } else {
+            webUrl
+        }
+        webView.loadUrl(urlToLoad)
 
 //        binding = ActivityMainBinding.inflate(layoutInflater)
 //        setContentView(R.layout.single_main)
@@ -381,6 +390,9 @@ class MainActivity : AppCompatActivity() {
         if (customView != null) {
             hideCustomView()
         }
+        runCatching { assetsStaticServer?.stop() }
+        assetsStaticServer = null
+        localAssetsOrigin = null
         webView.destroy()
         super.onDestroy()
     }
@@ -827,6 +839,36 @@ class MainActivity : AppCompatActivity() {
             .start()
     }
 
+    private fun ensureLocalAssetsServer(): String? {
+        localAssetsOrigin?.let { return it }
+        return try {
+            val server = AssetsStaticServer(0, assets)
+            server.start()
+            val port = server.listeningPort
+            if (port <= 0) return null
+            val origin = "http://127.0.0.1:$port"
+            assetsStaticServer = server
+            localAssetsOrigin = origin
+            origin
+        } catch (e: Exception) {
+            Log.e("MainActivity", "本地 assets 静态服务启动失败", e)
+            null
+        }
+    }
+
+    private fun androidAssetRelativePath(url: String): String? {
+        if (!url.startsWith("file:", ignoreCase = true)) return null
+        val key = "android_asset/"
+        val idx = url.indexOf(key, ignoreCase = true)
+        if (idx < 0) return null
+        return url.substring(idx + key.length).trimStart('/')
+    }
+
+    private fun toLocalServerUrl(origin: String, relativePath: String): String {
+        val p = relativePath.trimStart('/')
+        return if (p.isEmpty()) "$origin/" else "$origin/$p"
+    }
+
     inner class MyWebViewClient(val debug: Boolean) : WebViewClient() {
 
         private fun handleOverrideUrl(view: WebView?, rawUrl: String?): Boolean {
@@ -856,6 +898,10 @@ class MainActivity : AppCompatActivity() {
 
             // 对常见文件类型的 HTTP/HTTPS 链接，直接拦截为下载，不在 WebView 内打开
             if (fixedUrl.startsWith("http://") || fixedUrl.startsWith("https://")) {
+                val origin = localAssetsOrigin
+                if (origin != null && fixedUrl.startsWith(origin)) {
+                    return false
+                }
                 if (isDownloadableFileUrl(fixedUrl)) {
                     val ua = view?.settings?.userAgentString ?: ""
                     // 根据扩展名推断 MIME
@@ -871,9 +917,12 @@ class MainActivity : AppCompatActivity() {
                 return false
             }
 
-            // file:// 链接仍交给 WebView 处理
+            // file:///android_asset/ 统一走本地 http 服务，避免 file 协议下根路径解析问题
             if (fixedUrl.startsWith("file://")) {
-                return false
+                val rel = androidAssetRelativePath(fixedUrl) ?: return false
+                val o = localAssetsOrigin ?: ensureLocalAssetsServer() ?: return false
+                view?.loadUrl(toLocalServerUrl(o, rel))
+                return true
             }
 
             // --- 处理外部应用链接 ---

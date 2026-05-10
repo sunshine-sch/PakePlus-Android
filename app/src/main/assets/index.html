@@ -994,6 +994,7 @@
                     </div>
                 </div>
                 <div class="brush-dropdown">
+                    111
                     <button class="tool-btn active" id="brushBtn" title="画笔">
                         <i class="fas fa-pen"></i
                         ><span class="dropdown-arrow">▼</span>
@@ -1564,7 +1565,7 @@
                 let lastBoundsUpdate = 0
 
                 function setTransform(el, tx, ty, scale, rotate) {
-                    // 只在值变化时更新，减少重绘
+                    // 只在值变化时更新，减少重绘；translate3d + 亚像素位移利于合成层上跟手
                     if (
                         el._tx !== tx ||
                         el._ty !== ty ||
@@ -1575,23 +1576,31 @@
                         el._ty = ty
                         el._scale = scale
                         el._rotate = rotate
-                        el.style.transform = `translate(${Math.round(
-                            tx
-                        )}px, ${Math.round(
-                            ty
-                        )}px) scale(${scale}) rotate(${rotate}deg)`
+                        el.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${scale}) rotate(${rotate}deg)`
                     }
                 }
-                function clampPosition(el, tx, ty) {
+
+                function refreshSceneBoundsForDrag() {
+                    const rect = scene.getBoundingClientRect()
+                    sceneBounds = {
+                        width: rect.width,
+                        height: rect.height,
+                    }
+                    lastBoundsUpdate = Date.now()
+                }
+
+                function clampPosition(el, tx, ty, layoutSize) {
                     const now = Date.now()
-                    // 每100ms更新一次边界缓存
                     if (now - lastBoundsUpdate > 100) {
                         const rect = scene.getBoundingClientRect()
-                        sceneBounds = { width: rect.width, height: rect.height }
+                        sceneBounds = {
+                            width: rect.width,
+                            height: rect.height,
+                        }
                         lastBoundsUpdate = now
                     }
-                    const w = el.offsetWidth,
-                        h = el.offsetHeight
+                    const w = layoutSize ? layoutSize.w : el.offsetWidth
+                    const h = layoutSize ? layoutSize.h : el.offsetHeight
                     return {
                         x: Math.min(
                             sceneBounds.width - w * 0.3,
@@ -1601,6 +1610,44 @@
                             sceneBounds.height - h * 0.3,
                             Math.max(-h * 0.7, ty)
                         ),
+                    }
+                }
+
+                // 拖动中合并到每帧一次更新，减少布局读写在同一帧内重复执行
+                let dragLayoutBox = null
+                let dragMotionRaf = null
+                let dragMotionPending = null
+
+                function flushDragMotion() {
+                    dragMotionRaf = null
+                    const p = dragMotionPending
+                    if (!p) return
+                    dragMotionPending = null
+                    const pos = clampPosition(p.el, p.tx, p.ty, dragLayoutBox)
+                    setTransform(p.el, pos.x, pos.y, p.scale, p.rotate)
+                }
+
+                function scheduleDragMotion(el, tx, ty, scale, rotate) {
+                    dragMotionPending = { el, tx, ty, scale, rotate }
+                    if (dragMotionRaf == null)
+                        dragMotionRaf = requestAnimationFrame(flushDragMotion)
+                }
+
+                function flushDragMotionNow() {
+                    if (dragMotionRaf != null) {
+                        cancelAnimationFrame(dragMotionRaf)
+                        dragMotionRaf = null
+                    }
+                    const p = dragMotionPending
+                    dragMotionPending = null
+                    if (p) {
+                        const pos = clampPosition(
+                            p.el,
+                            p.tx,
+                            p.ty,
+                            dragLayoutBox
+                        )
+                        setTransform(p.el, pos.x, pos.y, p.scale, p.rotate)
                     }
                 }
 
@@ -1658,9 +1705,11 @@
                         }
                         // 使用 requestAnimationFrame 确保尺寸已经应用，然后再设置位置
                         requestAnimationFrame(() => {
-                            const rect = scene.getBoundingClientRect()
-                            const centerX = (rect.width - div.offsetWidth) / 2
-                            const centerY = (rect.height - div.offsetHeight) / 2
+                            refreshSceneBoundsForDrag()
+                            const centerX =
+                                (sceneBounds.width - div.offsetWidth) / 2
+                            const centerY =
+                                (sceneBounds.height - div.offsetHeight) / 2
                             const pos = clampPosition(div, centerX, centerY)
                             setTransform(div, pos.x, pos.y, 1.0, 0)
                         })
@@ -1672,9 +1721,9 @@
                         img.onerror = adjustSize
                     }
 
-                    const rect = scene.getBoundingClientRect()
-                    const centerX = (rect.width - div.offsetWidth) / 2
-                    const centerY = (rect.height - div.offsetHeight) / 2
+                    refreshSceneBoundsForDrag()
+                    const centerX = (sceneBounds.width - div.offsetWidth) / 2
+                    const centerY = (sceneBounds.height - div.offsetHeight) / 2
                     const pos = clampPosition(div, centerX, centerY)
                     setTransform(div, pos.x, pos.y, 1.0, 0)
 
@@ -1771,6 +1820,7 @@
                                 selectElement(el)
                                 return
                             }
+                            flushDragMotionNow()
                             activeDrag = el
                             const { tx, ty, scale, rotate } = getTransform(el)
                             dragStartX = touches[0].clientX
@@ -1779,6 +1829,11 @@
                             dragStartTy = ty
                             dragStartScale = scale
                             dragStartRotate = rotate
+                            refreshSceneBoundsForDrag()
+                            dragLayoutBox = {
+                                w: el.offsetWidth,
+                                h: el.offsetHeight,
+                            }
                             selectElement(el)
                             e.preventDefault()
                         }
@@ -1798,7 +1853,13 @@
                                 )
                         }
                         if (el && !isLocked(el)) {
+                            flushDragMotionNow()
                             activePinch = el
+                            refreshSceneBoundsForDrag()
+                            dragLayoutBox = {
+                                w: el.offsetWidth,
+                                h: el.offsetHeight,
+                            }
                             const center = getTouchCenter([
                                 touches[0],
                                 touches[1],
@@ -1852,11 +1913,10 @@
                         let newTx = pinchStartTx + dx
                         let newTy = pinchStartTy + dy
 
-                        const pos = clampPosition(activePinch, newTx, newTy)
-                        setTransform(
+                        scheduleDragMotion(
                             activePinch,
-                            pos.x,
-                            pos.y,
+                            newTx,
+                            newTy,
                             newScale,
                             newRotate
                         )
@@ -1870,11 +1930,10 @@
                         const dy = touches[0].clientY - dragStartY
                         let newTx = dragStartTx + dx
                         let newTy = dragStartTy + dy
-                        const pos = clampPosition(activeDrag, newTx, newTy)
-                        setTransform(
+                        scheduleDragMotion(
                             activeDrag,
-                            pos.x,
-                            pos.y,
+                            newTx,
+                            newTy,
                             dragStartScale,
                             dragStartRotate
                         )
@@ -1884,15 +1943,23 @@
 
                 // 触摸结束
                 function onTouchEnd(e) {
-                    // 触摸结束时保存场景状态（如果有过操作）
                     if (activeDrag || activePinch) {
+                        flushDragMotionNow()
                         saveSceneState()
                     }
                     if (e.touches.length === 0) {
                         activeDrag = null
                         activePinch = null
+                        dragLayoutBox = null
                     } else if (e.touches.length === 1) {
                         activePinch = null
+                        if (activeDrag) {
+                            refreshSceneBoundsForDrag()
+                            dragLayoutBox = {
+                                w: activeDrag.offsetWidth,
+                                h: activeDrag.offsetHeight,
+                            }
+                        }
                     }
                 }
 
@@ -1930,6 +1997,7 @@
                             selectElement(el)
                             return
                         }
+                        flushDragMotionNow()
                         mouseDragTarget = el
                         const { tx, ty, scale, rotate } = getTransform(el)
                         mouseStartX = e.clientX
@@ -1938,6 +2006,11 @@
                         mouseStartTy = ty
                         mouseStartScale = scale
                         mouseStartRotate = rotate
+                        refreshSceneBoundsForDrag()
+                        dragLayoutBox = {
+                            w: el.offsetWidth,
+                            h: el.offsetHeight,
+                        }
                         selectElement(el)
                     }
                 })
@@ -1950,11 +2023,10 @@
                         const dy = e.clientY - mouseStartY
                         let newTx = mouseStartTx + dx
                         let newTy = mouseStartTy + dy
-                        const pos = clampPosition(mouseDragTarget, newTx, newTy)
-                        setTransform(
+                        scheduleDragMotion(
                             mouseDragTarget,
-                            pos.x,
-                            pos.y,
+                            newTx,
+                            newTy,
                             mouseStartScale,
                             mouseStartRotate
                         )
@@ -1963,10 +2035,11 @@
 
                 document.addEventListener('mouseup', function () {
                     if (mouseDragTarget) {
-                        // 拖拽结束时保存场景状态
+                        flushDragMotionNow()
                         saveSceneState()
                     }
                     mouseDragTarget = null
+                    dragLayoutBox = null
                 })
 
                 // 滚轮缩放
@@ -3103,9 +3176,9 @@
                     document
                         .getElementById('eraserBtn')
                         .addEventListener('click', toggleEraser)
-                    document
-                        .getElementById('undoBtn')
-                        .addEventListener('click', undoScene)
+                    const undoBtnEl = document.getElementById('undoBtn')
+                    if (undoBtnEl)
+                        undoBtnEl.addEventListener('click', undoScene)
                     document
                         .getElementById('lockBtn')
                         .addEventListener('click', toggleItemsLock)
@@ -3115,9 +3188,9 @@
                     document
                         .getElementById('deleteBtn')
                         .addEventListener('click', deleteSelected)
-                    document
-                        .getElementById('clearBtn')
-                        .addEventListener('click', clearScene)
+                    const clearBtnEl = document.getElementById('clearBtn')
+                    if (clearBtnEl)
+                        clearBtnEl.addEventListener('click', clearScene)
 
                     // 设置默认背景选中状态
                     setBackground('cream')
